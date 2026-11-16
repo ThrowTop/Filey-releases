@@ -1,0 +1,98 @@
+name: Build
+
+# Manual only: no pull_request or push triggers, so nothing from a fork ever runs here with the deploy key.
+# Fetches the private Filey source with a read-only deploy key (FILEY_DEPLOY_KEY), builds and tests it on Windows,
+# and publishes the release here, where installed copies look for updates (the build's FILEY_REPOSITORY).
+# The update check takes the Filey-<version>-windows-x64.zip a release lists, so the archive keeps that name.
+# Build output stays on the runner; a failing step prints its last lines.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version (x.y.z); empty is the last release plus one patch
+        required: false
+      ref:
+        description: Filey commit or branch
+        default: main
+      publish:
+        description: Publish (installed copies update to it); otherwise a draft
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# One release at a time, as each picks its version from the newest published one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Fetch Filey
+        shell: pwsh
+        env:
+          KEY: ${{ secrets.FILEY_DEPLOY_KEY }}
+          REF: ${{ inputs.ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keyFile = Join-Path $env:RUNNER_TEMP ([IO.Path]::GetRandomFileName())
+          [IO.File]::WriteAllText($keyFile, ($env:KEY -replace "`r", '') + "`n")
+          $env:GIT_SSH_COMMAND = "ssh -i '$($keyFile.Replace('\', '/'))' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git init -q filey
+          git -C filey fetch -q --depth 1 git@github.com:ThrowTop/Filey.git $env:REF
+          $fetched = $LASTEXITCODE
+          Remove-Item $keyFile
+          if ($fetched) { throw "Fetching Filey $env:REF failed." }
+          git -C filey checkout -q FETCH_HEAD
+
+      - name: Version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          $version = $env:VERSION_INPUT
+          if (-not $version) {
+            $tag = gh api 'repos/${{ github.repository }}/releases/latest' --jq .tag_name 2>$null
+            if ($LASTEXITCODE -or $tag -notmatch '^v(\d+)\.(\d+)\.(\d+)$') { throw 'There is no release to follow; give the version.' }
+            $version = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'The version must be x.y.z.' }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      # CMake 4.3 or later, newer than the runner may have.
+      - uses: lukka/get-cmake@latest
+      # #embed needs Clang 19 or later, newer than the runner may have.
+      - name: Install LLVM and Ninja
+        run: choco upgrade llvm ninja -y --no-progress
+
+      - name: Build and test
+        shell: pwsh
+        working-directory: filey
+        run: |
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          $env:FILEY_VERSION = $env:VERSION
+          $log = Join-Path $env:RUNNER_TEMP 'build.log'
+          function Step([string]$name, [scriptblock]$command) {
+            & $command *> $log
+            if ($LASTEXITCODE) { Get-Content $log -Tail 40; throw "$name failed." }
+            Write-Host "$name done."
+          }
+          Step 'Configure' { cmake --preset release -DFILEY_SYNC_INSTALL=OFF "-DFILEY_REPOSITORY=${{ github.repository }}" }
+          Step 'Build' { cmake --build --preset release }
+          Step 'Test' { ctest --preset release }
+          Compress-Archive -Path Bin/release/Filey.exe -DestinationPath "../Filey-$env:VERSION-windows-x64.zip"
+          Compress-Archive -Path Bin/release/Filey.pdb -DestinationPath "../Filey-$env:VERSION-windows-x64-symbols.zip"
+
+      # Installed copies update from published releases only; a draft waits for the owner.
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Filey ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ !inputs.publish }}
+          files: Filey-*-windows-x64*.zip
